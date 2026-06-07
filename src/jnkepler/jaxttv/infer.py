@@ -18,7 +18,70 @@ from copy import deepcopy
 import time
 import warnings
 
-from .utils import params_to_dict, dict_to_params
+from .symplectic import integrate_xv
+from .utils import (
+    dict_to_params,
+    get_energy_diff_jac,
+    initialize_jacobi_xv,
+    params_to_dict,
+)
+
+
+def _canonicalize_transit_time_method(method):
+    """Return the canonical transit-time method name."""
+    if method is None:
+        return None
+    if method == "newton-raphson":
+        warnings.warn(
+            "'newton-raphson' is deprecated; use 'newton' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        method = "newton"
+    elif method == "interpolation":
+        warnings.warn(
+            "'interpolation' is deprecated; use 'kepler' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        method = "kepler"
+
+    if method not in ("fast", "newton", "kepler"):
+        raise ValueError(
+            "transit_time_method must be one of 'fast', 'newton', or 'kepler'."
+        )
+    return method
+
+
+def _get_transit_times_obs_with_method(
+    jttv,
+    par_dict,
+    transit_orbit_idx=None,
+    transit_time_method=None,
+):
+    """Compute observed transit times with an explicit transit-time method."""
+    if transit_time_method is None:
+        transit_time_method = jttv.transit_time_method
+
+    xjac0, vjac0, masses = initialize_jacobi_xv(par_dict, jttv.t_start)
+    times, xvjac = integrate_xv(
+        xjac0, vjac0, masses, jttv.times, nitr=jttv.nitr_kepler)
+
+    if transit_orbit_idx is None:
+        orbit_idx = jttv.pidx.astype(int) - 1
+    else:
+        orbit_idx = transit_orbit_idx[jttv.pidx.astype(int) - 1].astype(int)
+
+    transit_times = jttv._compute_transit_times(
+        orbit_idx,
+        jttv.tcobs_flatten,
+        times,
+        xvjac,
+        masses,
+        method=transit_time_method,
+    )
+    ediff = get_energy_diff_jac(xvjac, masses, -0.5 * jttv.dt)
+    return transit_times, ediff
 
 
 def ttv_default_parameter_bounds(jttv, npl=None, t0_guess=None, p_guess=None,
@@ -117,6 +180,7 @@ def _get_cached_residual_functions(
     npl,
     keys,
     transit_orbit_idx=None,
+    transit_time_method=None,
     jac=False,
     diff_mode="fwd",
 ):
@@ -133,6 +197,7 @@ def _get_cached_residual_functions(
         npl,
         tuple(keys),
         None if transit_orbit_idx is None else tuple(transit_orbit_idx),
+        transit_time_method,
         bool(jac),
         diff_mode,
     )
@@ -140,9 +205,11 @@ def _get_cached_residual_functions(
     if cache_key not in jttv._lsq_cache:
         def _model(p_flat):
             pdic = params_to_dict(p_flat, npl, keys)
-            return jttv.get_transit_times_obs(
+            return _get_transit_times_obs_with_method(
+                jttv,
                 pdic,
                 transit_orbit_idx=transit_orbit_idx,
+                transit_time_method=transit_time_method,
             )[0]
 
         def _resid(p_flat):
@@ -266,7 +333,7 @@ def ttv_optim_least_squares(
     loss="linear",
     loss_kwargs=None,
     jac=False,
-    diff_mode="auto",
+    diff_mode="fwd",
     plot=True,
     save=None,
     transit_orbit_idx=None,
@@ -274,6 +341,8 @@ def ttv_optim_least_squares(
     max_nfev=None,
     param_transform=None,
     return_optspace=False,
+    gaussian_priors=None,
+    transit_time_method="newton",
 ):
     """Simple TTV fit using scipy.optimize.least_squares.
 
@@ -292,6 +361,11 @@ def ttv_optim_least_squares(
                 'huber', 'cauchy', 'arctan'
               - 'student_t' to use Student-t negative log likelihood
               - a custom callable compatible with scipy.optimize.least_squares
+
+            Gaussian priors are currently not supported with loss='student_t'.
+            With other non-linear losses, the Gaussian-prior residuals are
+            passed to scipy.optimize.least_squares in the same residual vector
+            as the data residuals.
         loss_kwargs: optional dict for loss-specific options. Default is None.
             For loss='student_t':
                 {'nu': ..., 'scale': ...}
@@ -306,13 +380,11 @@ def ttv_optim_least_squares(
         jac: if True, use a JAX-based analytic Jacobian for the residual
             function.
         diff_mode: differentiation mode for the analytic Jacobian when
-            jac=True. Must be one of:
+            jac=True. Defaults to 'fwd' (``jax.jacfwd``). Must be one of:
+              - 'fwd': use ``jax.jacfwd``
+              - 'rev': use ``jax.jacrev``
               - 'auto': use 'fwd' for transit_time_method='fast' and
                 'rev' for transit_time_method='newton'
-              - 'rev'
-              - 'fwd'
-            Note: for transit_time_method='newton', 'fwd' is overridden to
-            'rev' because forward-mode differentiation may fail there.
         plot: if True, TTV models are plotted with data.
         save: path to save TTV plots.
         transit_orbit_idx: list of indices to specify which planets are
@@ -328,6 +400,37 @@ def ttv_optim_least_squares(
         return_optspace: if True, also return the best-fit parameter dictionary
             in optimizer space as a second output. This is useful for warm
             starts when param_transform is used.
+        gaussian_priors: optional Gaussian priors on optimizer-space parameters.
+            This is a dict of {key: prior_spec}. Each prior_spec can be either
+
+                {'index': idx, 'mean': mean, 'sigma': sigma}
+
+            or
+
+                (idx, mean, sigma)
+
+            where idx can be an int or a list/array of indices. If idx is None
+            or omitted, the prior is applied to all elements of that parameter.
+
+            The important point is that the prior is applied before
+            param_transform. Therefore, if param_transform maps optimizer-space
+            parameters to model-space parameters, gaussian_priors refers to the
+            optimizer-space values, not the transformed model-space values.
+
+            The added residual is
+
+                (p_opt - mean) / sigma.
+
+            Example:
+
+                gaussian_priors={
+                    'period': {'index': 7, 'mean': 60.0, 'sigma': 1.0},
+                    'lnpmass': {'index': 7, 'mean': np.log(3e-5), 'sigma': 0.5},
+                }
+        transit_time_method: algorithm used for transit-time computation during
+            least-squares optimization. Defaults to 'newton'. Supported values
+            are 'fast', 'newton', and 'kepler'. Set to None to use
+            ``jttv.transit_time_method``.
 
     Returns:
         dict or tuple:
@@ -341,13 +444,20 @@ def ttv_optim_least_squares(
     if loss_kwargs is None:
         loss_kwargs = {}
 
+    if gaussian_priors is not None and loss == "student_t":
+        raise NotImplementedError(
+            "gaussian_priors is currently not supported with loss='student_t'."
+        )
+
     if diff_mode not in ("auto", "rev", "fwd"):
         raise ValueError(
             f"diff_mode must be 'auto', 'rev', or 'fwd', got {diff_mode!r}"
         )
 
-    # resolve differentiation mode
-    transit_time_method = jttv.transit_time_method
+    # resolve transit-time and differentiation modes
+    transit_time_method = _canonicalize_transit_time_method(transit_time_method)
+    if transit_time_method is None:
+        transit_time_method = jttv.transit_time_method
 
     if diff_mode == "auto":
         effective_diff_mode = (
@@ -355,13 +465,6 @@ def ttv_optim_least_squares(
         )
     else:
         effective_diff_mode = diff_mode
-
-    if jac and transit_time_method == "newton" and effective_diff_mode == "fwd":
-        warnings.warn(
-            "diff_mode='fwd' is not supported reliably with "
-            "transit_time_method='newton'; using diff_mode='rev' instead."
-        )
-        effective_diff_mode = "rev"
 
     # check non-transiting planets
     npl = len(param_bounds["period"][0])
@@ -400,18 +503,101 @@ def ttv_optim_least_squares(
     params_upper = np.hstack([param_bounds[key][1] for key in keys])
     bounds = (params_lower, params_upper)
 
-    # slice for lnpmass in the flattened parameter vector
+    # slices in the flattened optimizer-space parameter vector
     offset = 0
+    key_slices = {}
     mass_slice = None
+
     for key in keys:
         n = len(param_bounds[key][0])
+        key_slices[key] = slice(offset, offset + n)
+
         if key == "lnpmass":
-            mass_slice = slice(offset, offset + n)
-            break
+            mass_slice = key_slices[key]
+
         offset += n
 
     if mass_slice is None:
         raise ValueError("lnpmass not found in optimization keys.")
+
+    def _parse_gaussian_priors(gaussian_priors):
+        """Parse Gaussian priors on optimizer-space parameters."""
+        if gaussian_priors is None:
+            return []
+
+        prior_terms = []
+
+        for key, spec in gaussian_priors.items():
+            if key not in key_slices:
+                raise ValueError(
+                    f"Gaussian prior key {key!r} is not in optimized keys: {keys}."
+                )
+
+            key_slice = key_slices[key]
+            n_key = key_slice.stop - key_slice.start
+
+            if isinstance(spec, dict):
+                idx = spec.get("index", spec.get("idx", spec.get("indices", None)))
+                mean = spec["mean"]
+                sigma = spec["sigma"]
+            else:
+                if len(spec) != 3:
+                    raise ValueError(
+                        "Gaussian prior spec must be either a dict with "
+                        "'index', 'mean', and 'sigma', or a tuple "
+                        "(index, mean, sigma)."
+                    )
+                idx, mean, sigma = spec
+
+            if idx is None:
+                idx = np.arange(n_key, dtype=int)
+            elif np.isscalar(idx):
+                idx = np.array([idx], dtype=int)
+            else:
+                idx = np.asarray(idx, dtype=int)
+
+            if np.any(idx < 0) or np.any(idx >= n_key):
+                raise ValueError(
+                    f"Gaussian prior index out of range for {key!r}: {idx}."
+                )
+
+            mean = np.asarray(mean, dtype=float)
+            sigma = np.asarray(sigma, dtype=float)
+
+            if mean.ndim == 0:
+                mean = np.full(idx.size, float(mean))
+            if sigma.ndim == 0:
+                sigma = np.full(idx.size, float(sigma))
+
+            if mean.shape != (idx.size,):
+                raise ValueError(
+                    f"mean for Gaussian prior {key!r} must have shape "
+                    f"{(idx.size,)}, got {mean.shape}."
+                )
+
+            if sigma.shape != (idx.size,):
+                raise ValueError(
+                    f"sigma for Gaussian prior {key!r} must have shape "
+                    f"{(idx.size,)}, got {sigma.shape}."
+                )
+
+            if np.any(sigma <= 0):
+                raise ValueError(f"sigma must be positive for Gaussian prior {key!r}.")
+
+            flat_idx = key_slice.start + idx
+
+            prior_terms.append(
+                (
+                    jnp.asarray(flat_idx, dtype=int),
+                    jnp.asarray(mean),
+                    jnp.asarray(sigma),
+                )
+            )
+
+        return prior_terms
+
+    gaussian_prior_terms = _parse_gaussian_priors(gaussian_priors)
+    n_gaussian_prior = sum(len(idx) for idx, _, _ in gaussian_prior_terms)
 
     if isinstance(random_state, np.random.RandomState):
         rng = random_state
@@ -423,6 +609,7 @@ def ttv_optim_least_squares(
         npl=npl,
         keys=keys,
         transit_orbit_idx=transit_orbit_idx,
+        transit_time_method=transit_time_method,
         jac=jac,
         diff_mode=effective_diff_mode,
     )
@@ -434,14 +621,40 @@ def ttv_optim_least_squares(
             return p
         return param_transform(p)
 
-    def resid_jax(p):
+    def gaussian_prior_resid_jax(p_opt):
+        """Gaussian-prior residuals in optimizer space."""
+        if len(gaussian_prior_terms) == 0:
+            return jnp.zeros((0,), dtype=p_opt.dtype)
+
+        return jnp.concatenate(
+            [
+                (p_opt[idx] - mean) / sigma
+                for idx, mean, sigma in gaussian_prior_terms
+            ]
+        )
+
+    def resid_data_jax(p):
+        """Data residuals only."""
         return resid_base(transform_p(p))
 
+    def resid_jax(p):
+        """Data residuals plus Gaussian-prior residuals.
+
+        The data model sees transform_p(p), but Gaussian priors are applied
+        directly to p, i.e. before param_transform.
+        """
+        r_data = resid_data_jax(p)
+        r_prior = gaussian_prior_resid_jax(p)
+        return jnp.concatenate([r_data, r_prior])
+
     if jac:
-        if param_transform is None:
+        if (
+            param_transform is None
+            and len(gaussian_prior_terms) == 0
+        ):
             jac_resid_jax = jac_resid_base
         else:
-            # include chain rule through param_transform
+            # include chain rule through param_transform and prior residuals
             if effective_diff_mode == "rev":
                 jac_resid_jax = jax.jit(jax.jacrev(resid_jax))
             else:
@@ -450,11 +663,25 @@ def ttv_optim_least_squares(
     def resid_np(p):
         return np.array(resid_jax(jnp.asarray(p)), dtype=float, copy=True)
 
+    def resid_data_np(p):
+        return np.array(resid_data_jax(jnp.asarray(p)), dtype=float, copy=True)
+
+    def resid_prior_np(p):
+        return np.array(
+            gaussian_prior_resid_jax(jnp.asarray(p)),
+            dtype=float,
+            copy=True,
+        )
+
     def jac_np(p):
         return np.array(jac_resid_jax(jnp.asarray(p)), dtype=float, copy=True)
 
-    def chi2_np(p):
-        r = resid_np(p)
+    def chi2_data_np(p):
+        r = resid_data_np(p)
+        return float(np.sum(r**2))
+
+    def chi2_prior_np(p):
+        r = resid_prior_np(p)
         return float(np.sum(r**2))
 
     # warm up once per cache key / transform choice
@@ -464,11 +691,15 @@ def ttv_optim_least_squares(
         p_warm = 0.5 * (params_lower + params_upper)
     p_warm = np.clip(p_warm, params_lower, params_upper)
 
-    if (not cache["is_warmed"]) or (param_transform is not None):
+    if (
+        (not cache["is_warmed"])
+        or (param_transform is not None)
+        or (len(gaussian_prior_terms) > 0)
+    ):
         _ = resid_np(p_warm)
         if jac:
             _ = jac_np(p_warm)
-        if param_transform is None:
+        if param_transform is None and len(gaussian_prior_terms) == 0:
             cache["is_warmed"] = True
 
     if pinit is not None and n_start != 1:
@@ -488,11 +719,13 @@ def ttv_optim_least_squares(
 
     best_popt = None
     best_cost = np.inf
-    best_chi2 = np.inf
+    best_chi2_data = np.inf
+    best_chi2_prior = np.inf
 
     print(
         "# running least squares optimization "
         f"(n_start={n_start_eff}, loss={loss}, "
+        f"n_gaussian_prior={n_gaussian_prior}, "
         f"transit_time_method={transit_time_method}, "
         f"jac={'on' if jac else 'off'}, "
         f"diff_mode={effective_diff_mode if jac else 'n/a'})..."
@@ -514,7 +747,8 @@ def ttv_optim_least_squares(
 
         p0 = np.clip(p0, params_lower, params_upper)
 
-        chi2_init = chi2_np(p0)
+        chi2_data_init = chi2_data_np(p0)
+        chi2_prior_init = chi2_prior_np(p0)
         t0 = time.time()
 
         try:
@@ -533,7 +767,8 @@ def ttv_optim_least_squares(
             continue
 
         dt = time.time() - t0
-        chi2_fin = float(np.sum(res.fun**2))
+        chi2_data_fin = chi2_data_np(res.x)
+        chi2_prior_fin = chi2_prior_np(res.x)
         cost_fin = float(res.cost)
 
         pmass0_str = np.array2string(
@@ -544,20 +779,24 @@ def ttv_optim_least_squares(
 
         print(
             f"# start {i}: initial pmass={pmass0_str}, "
-            f"chi2={chi2_init:.2f} --> {chi2_fin:.2f}, "
+            f"data_chi2={chi2_data_init:.2f} --> {chi2_data_fin:.2f}, "
+            f"prior_chi2={chi2_prior_init:.2f} --> {chi2_prior_fin:.2f}, "
             f"cost={cost_fin:.2f}, nfev={res.nfev}, elapsed={dt:.1f} s"
         )
 
         if cost_fin < best_cost:
             best_cost = cost_fin
-            best_chi2 = chi2_fin
+            best_chi2_data = chi2_data_fin
+            best_chi2_prior = chi2_prior_fin
             best_popt = res.x
 
     print("# ------------------------------------------------------------")
     print(
         "# best objective over all starts: "
-        f"cost={best_cost:.2f}, chi2={best_chi2:.2f} "
-        f"({len(jttv.tcobs_flatten)} data)"
+        f"cost={best_cost:.2f}, "
+        f"data_chi2={best_chi2_data:.2f}, "
+        f"prior_chi2={best_chi2_prior:.2f} "
+        f"({len(jttv.tcobs_flatten)} data + {n_gaussian_prior} Gaussian priors)"
     )
     print("# total elapsed time: %.1f sec" % (time.time() - t0_all))
     print("# ------------------------------------------------------------")
@@ -578,20 +817,21 @@ def ttv_optim_least_squares(
             np.median(np.asarray(jttv.errorobs_flatten, dtype=float)))
 
         tc_fast = np.asarray(
-            jttv.get_transit_times_obs(
+            _get_transit_times_obs_with_method(
+                jttv,
                 pdic_opt,
                 transit_orbit_idx=transit_orbit_idx,
+                transit_time_method="fast",
             )[0],
             dtype=float,
         )
 
-        jttv_newton = deepcopy(jttv)
-        jttv_newton.transit_time_method = "newton"
-
         tc_newton = np.asarray(
-            jttv_newton.get_transit_times_obs(
+            _get_transit_times_obs_with_method(
+                jttv,
                 pdic_opt,
                 transit_orbit_idx=transit_orbit_idx,
+                transit_time_method="newton",
             )[0],
             dtype=float,
         )
