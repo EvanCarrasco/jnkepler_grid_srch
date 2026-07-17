@@ -564,7 +564,7 @@ class JaxTTV(Nbody):
 
         return tc, tc2
 
-    def sample_means_and_stds(self, samples, N=50, truncate=True, original_models=False):
+    def sample_means_and_stds(self, samples, N=50, truncate=True, original_models=False, transit_orbit_idx=None):
         """compute mean and standard deviation of transit time models from HMC samples
 
             Args:
@@ -582,7 +582,7 @@ class JaxTTV(Nbody):
         models, means, stds = [], [], []
         for idx in sample_indices:
             pdic_ = {key: val[idx] for key, val in samples.items()}
-            tc_list = self.get_transit_times_all_list(pdic_, truncate=truncate)
+            tc_list = self.get_transit_times_all_list(pdic_, truncate=truncate, transit_orbit_idx=transit_orbit_idx)
             models.append(tc_list)
 
         if original_models:
